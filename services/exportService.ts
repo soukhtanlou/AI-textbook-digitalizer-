@@ -29,7 +29,8 @@ export const exportToZip = async (course: CourseData) => {
     
     // 1. Main Image (Stored as Base64 in state)
     // We convert it to binary for ZIP
-    const imgBlob = new Blob([decodeBase64(p.imageBase64)], { type: 'image/jpeg' });
+    // Fix: cast to any to avoid TS strict error regarding SharedArrayBuffer vs ArrayBuffer
+    const imgBlob = new Blob([decodeBase64(p.imageBase64) as any], { type: 'image/jpeg' });
     assets.file(`${pagePrefix}_main.jpg`, imgBlob);
 
     // 2. Teacher Audio
