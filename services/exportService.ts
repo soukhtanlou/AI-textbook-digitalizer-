@@ -1,86 +1,74 @@
 
-import JSZip from 'jszip';
 import { CourseData } from "../types";
-import { decodeBase64 } from "../utils/audioUtils";
+import { readFileFromFolder } from "../utils/fileSystem";
+import JSZip from 'jszip';
 
-// Helper to get raw bytes from Data URL
-function dataURItoBlob(dataURI: string): Blob {
-    // Split metadata from data
-    const parts = dataURI.split(',');
-    const byteString = atob(parts[1]);
-    const mimeString = parts[0].split(':')[1].split(';')[0];
-    const ab = new ArrayBuffer(byteString.length);
-    const ia = new Uint8Array(ab);
-    for (let i = 0; i < byteString.length; i++) {
-        ia[i] = byteString.charCodeAt(i);
-    }
-    return new Blob([ab], { type: mimeString });
-}
-
-export const exportToZip = async (course: CourseData) => {
+export const exportToZip = async (course: CourseData, dirHandle: FileSystemDirectoryHandle) => {
   const zip = new JSZip();
-  const assets = zip.folder("assets");
+  const assetsFolder = zip.folder("assets");
   
-  if (!assets) throw new Error("Could not create assets folder");
-
-  // Iterate over pages and add files to the ZIP
-  const exportPages = await Promise.all(course.pages.map(async (p) => {
-    const pagePrefix = `p${p.pageNumber}`;
+  // 1. Collect all data and add media to zip
+  const pagesExportData = await Promise.all(course.pages.map(async (p) => {
+    // Only export if included AND filename exists
     
-    // 1. Main Image (Stored as Base64 in state)
-    // We convert it to binary for ZIP
-    // Fix: cast to any to avoid TS strict error regarding SharedArrayBuffer vs ArrayBuffer
-    const imgBlob = new Blob([decodeBase64(p.imageBase64) as any], { type: 'image/jpeg' });
-    assets.file(`${pagePrefix}_main.jpg`, imgBlob);
-
-    // 2. Teacher Audio
-    let teacherAudioPath = null;
-    if (p.includeTeacherAudio && p.teacherAudioBlob) {
-        assets.file(`${pagePrefix}_teacher.wav`, p.teacherAudioBlob);
-        teacherAudioPath = `assets/${pagePrefix}_teacher.wav`;
+    // Copy Teacher Audio
+    if (p.includeTeacherAudio && p.teacherAudioFilename) {
+        try {
+            const blob = await readFileFromFolder(dirHandle, p.teacherAudioFilename);
+            assetsFolder?.file(p.teacherAudioFilename, blob);
+        } catch (e) { console.error("Missing file", p.teacherAudioFilename); }
     }
 
-    // 3. Storyboard Image (Data URI from Gemini)
-    let storyboardPath = null;
-    if (p.includeStoryboard && p.storyboardImage) {
-        const sbBlob = dataURItoBlob(p.storyboardImage);
-        assets.file(`${pagePrefix}_storyboard.png`, sbBlob);
-        storyboardPath = `assets/${pagePrefix}_storyboard.png`;
+    // Copy Dialogue Audio
+    if (p.includeDialogueAudio && p.dialogueAudioFilename) {
+        try {
+            const blob = await readFileFromFolder(dirHandle, p.dialogueAudioFilename);
+            assetsFolder?.file(p.dialogueAudioFilename, blob);
+        } catch(e) {}
     }
 
-    // 4. Video (Veo)
-    let videoPath = null;
-    if (p.includeVideo && p.videoBlob) {
-        assets.file(`${pagePrefix}_video.mp4`, p.videoBlob);
-        videoPath = `assets/${pagePrefix}_video.mp4`;
+    // Copy Video
+    if (p.includeVideo && p.videoFilename) {
+        try {
+            const blob = await readFileFromFolder(dirHandle, p.videoFilename);
+            assetsFolder?.file(p.videoFilename, blob);
+        } catch(e) {}
     }
 
-    // 5. Dialogue Audio
-    let dialogueAudioPath = null;
-    if (p.includeDialogueAudio && p.dialogueAudioBlob) {
-        assets.file(`${pagePrefix}_dialogue.wav`, p.dialogueAudioBlob);
-        dialogueAudioPath = `assets/${pagePrefix}_dialogue.wav`;
+    // Copy Storyboard Image
+    if (p.includeStoryboard && p.storyboardImageFilename) {
+        try {
+            const blob = await readFileFromFolder(dirHandle, p.storyboardImageFilename);
+            assetsFolder?.file(p.storyboardImageFilename, blob);
+        } catch(e) {}
     }
 
-    // Return the data structure that the HTML player will use
+    // Copy Original Image (Always needed for page view)
+    if (p.imageFilename) {
+        try {
+            const blob = await readFileFromFolder(dirHandle, p.imageFilename);
+            assetsFolder?.file(p.imageFilename, blob);
+        } catch(e) {}
+    }
+    
+    // Return clean object referencing files in 'assets/'
     return {
-        pageNumber: p.pageNumber,
-        // extractedText & imageDescription removed from export data to save space and ensure privacy
-        
-        imagePath: `assets/${pagePrefix}_main.jpg`,
-        teacherAudioPath,
-        storyboardPath,
-        videoPath,
-        dialogueAudioPath
+      ...p,
+      // Paths relative to index.html
+      imagePath: p.imageFilename ? `assets/${p.imageFilename}` : null,
+      teacherAudioPath: (p.includeTeacherAudio && p.teacherAudioFilename) ? `assets/${p.teacherAudioFilename}` : null,
+      dialogueAudioPath: (p.includeDialogueAudio && p.dialogueAudioFilename) ? `assets/${p.dialogueAudioFilename}` : null,
+      videoPath: (p.includeVideo && p.videoFilename) ? `assets/${p.videoFilename}` : null,
+      storyboardImagePath: (p.includeStoryboard && p.storyboardImageFilename) ? `assets/${p.storyboardImageFilename}` : null,
     };
   }));
 
   const exportData = {
-      title: course.title,
-      pages: exportPages
+    ...course,
+    pages: pagesExportData
   };
 
-  // Generate the Index HTML
+  // 2. Generate HTML (Clean, referencing external files)
   const htmlContent = `
 <!DOCTYPE html>
 <html lang="fa" dir="rtl">
@@ -112,33 +100,27 @@ export const exportToZip = async (course: CourseData) => {
             --section-border: #444;
         }
 
-        body { margin: 0; font-family: 'Vazirmatn', sans-serif; background: var(--bg-color); color: var(--text-color); height: 100vh; display: flex; flex-direction: column; overflow: hidden; transition: all 0.3s; }
-        
+        body { margin: 0; font-family: 'Vazirmatn', 'Tahoma', 'Arial', sans-serif; background: var(--bg-color); color: var(--text-color); height: 100vh; display: flex; flex-direction: column; overflow: hidden; transition: all 0.3s; }
         .header { background: var(--header-bg); color: var(--header-text); padding: 0.5rem 1rem; text-align: center; box-shadow: 0 2px 5px rgba(0,0,0,0.2); z-index: 10; flex-shrink: 0; display: flex; flex-direction: column; gap: 0.5rem; }
         .header-top { display: flex; justify-content: space-between; align-items: center; width: 100%; }
         .toolbar { display: flex; gap: 0.5rem; justify-content: center; padding-top: 0.5rem; border-top: 1px solid rgba(255,255,255,0.1); }
-        
         .content-area { flex: 1; overflow-y: auto; padding: 1rem; max-width: 800px; margin: 0 auto; width: 100%; box-sizing: border-box; }
         .card { background: var(--card-bg); border-radius: 1rem; box-shadow: 0 4px 6px rgba(0,0,0,0.1); overflow: hidden; margin-bottom: 2rem; border: 1px solid var(--section-border); }
-        
         .image-container { overflow: hidden; position: relative; width: 100%; background: #000; cursor: grab; }
         .image-container:active { cursor: grabbing; }
         .page-image { width: 100%; display: block; transition: transform 0.2s ease-out; transform-origin: center center; pointer-events: none; }
-        
         .section { padding: 1rem; border-bottom: 1px solid var(--section-border); }
         .section:last-child { border-bottom: none; }
         .section-title { font-size: 1rem; font-weight: bold; opacity: 0.8; margin-bottom: 0.5rem; display: flex; align-items: center; gap: 0.5rem; }
-        
         .audio-player { width: 100%; margin-top: 0.5rem; }
         .storyboard-img { width: 100%; border-radius: 0.5rem; border: 2px solid #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         .video-player { width: 100%; border-radius: 0.5rem; background: #000; }
-        
+        .text-content { background: #f8fafc; padding: 0.8rem; border-radius: 0.5rem; white-space: pre-line; line-height: 1.6; font-size: 0.95rem; }
+        body.high-contrast .text-content { background: #222; color: #fff; }
         .btn { background: var(--btn-bg); border: 1px solid var(--btn-bg); color: var(--btn-text); padding: 0.5rem 1rem; border-radius: 0.5rem; cursor: pointer; font-family: inherit; font-size: 1rem; transition: 0.2s; }
         .btn:hover { opacity: 0.8; }
         .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-        
         .tool-btn { font-size: 0.8rem; padding: 0.3rem 0.6rem; }
-
         .speed-controls { display: flex; gap: 5px; margin-top: 5px; }
         .speed-btn { background: #e2e8f0; border: none; border-radius: 4px; padding: 2px 8px; font-size: 0.8rem; cursor: pointer; color: #333; }
         .speed-btn.active { background: #0e7490; color: white; }
@@ -160,50 +142,46 @@ export const exportToZip = async (course: CourseData) => {
             <button id="resetZoomBtn" class="btn tool-btn">بازنشانی</button>
         </div>
     </div>
-
     <div id="app" class="content-area"></div>
-
     <script>
         const DATA = ${JSON.stringify(exportData)};
         let currentPageIndex = 0;
-        let currentZoom = 1;
-        let panX = 0;
-        let panY = 0;
+        let currentZoom = 1; let panX = 0; let panY = 0;
 
         const appEl = document.getElementById('app');
         const titleEl = document.getElementById('pageTitle');
         const prevBtn = document.getElementById('prevBtn');
         const nextBtn = document.getElementById('nextBtn');
-        const contrastBtn = document.getElementById('contrastBtn');
-        
         const zoomInBtn = document.getElementById('zoomInBtn');
         const zoomOutBtn = document.getElementById('zoomOutBtn');
         const resetZoomBtn = document.getElementById('resetZoomBtn');
 
         function updateZoom() {
             const img = document.querySelector('.page-image');
-            if(img) {
-                img.style.transform = \`scale(\${currentZoom}) translate(\${panX}px, \${panY}px)\`;
-            }
+            if(img) img.style.transform = \`scale(\${currentZoom}) translate(\${panX}px, \${panY}px)\`;
         }
-
         zoomInBtn.onclick = () => { currentZoom += 0.2; updateZoom(); };
         zoomOutBtn.onclick = () => { currentZoom = Math.max(1, currentZoom - 0.2); updateZoom(); };
         resetZoomBtn.onclick = () => { currentZoom = 1; panX = 0; panY = 0; updateZoom(); };
-        contrastBtn.onclick = () => { document.body.classList.toggle('high-contrast'); };
+        document.getElementById('contrastBtn').onclick = () => document.body.classList.toggle('high-contrast');
 
         function renderPage(index) {
             currentZoom = 1; panX = 0; panY = 0;
             const page = DATA.pages[index];
             if (!page) return;
-
             titleEl.textContent = \`\${DATA.title} - صفحه \${page.pageNumber}\`;
             
             let html = \`
                 <div class="card">
-                    <div class="image-container" id="imgContainer">
-                        <img src="\${page.imagePath}" class="page-image" />
+                    \${page.imagePath ? \`<div class="image-container" id="imgContainer"><img src="\${page.imagePath}" class="page-image" /></div>\` : ''}
+
+                    \${(page.extractedText || page.imageDescription) ? \`
+                    <div class="section">
+                        <div class="section-title">📄 محتوای متنی</div>
+                        \${page.extractedText ? \`<div><strong>متن صفحه:</strong><div class="text-content">\${page.extractedText}</div></div>\` : ''}
+                        \${page.imageDescription ? \`<div><strong>شرح تصویر:</strong><div class="text-content">\${page.imageDescription}</div></div>\` : ''}
                     </div>
+                    \` : ''}
                     
                     \${page.teacherAudioPath ? \`
                     <div class="section" style="background: rgba(224, 231, 255, 0.3);">
@@ -217,18 +195,12 @@ export const exportToZip = async (course: CourseData) => {
                     </div>
                     \` : ''}
 
-                    \${page.storyboardPath ? \`
-                    <div class="section">
-                        <div class="section-title">🎨 تصویرسازی آموزشی</div>
-                        <img src="\${page.storyboardPath}" class="storyboard-img" />
-                    </div>
+                    \${page.storyboardImagePath ? \`
+                    <div class="section"><div class="section-title">🎨 تصویرسازی آموزشی</div><img src="\${page.storyboardImagePath}" class="storyboard-img" /></div>
                     \` : ''}
 
                     \${page.videoPath ? \`
-                    <div class="section">
-                        <div class="section-title">🎬 ویدیوی آموزشی</div>
-                        <video controls class="video-player" src="\${page.videoPath}"></video>
-                    </div>
+                    <div class="section"><div class="section-title">🎬 ویدیوی آموزشی</div><video controls class="video-player" src="\${page.videoPath}"></video></div>
                     \` : ''}
 
                     \${page.dialogueAudioPath ? \`
@@ -244,59 +216,26 @@ export const exportToZip = async (course: CourseData) => {
                     \` : ''}
                 </div>
             \`;
-
             appEl.innerHTML = html;
             
             const container = document.getElementById('imgContainer');
-            let isDragging = false;
-            let startX, startY;
-
-            container.addEventListener('mousedown', (e) => {
-                if(currentZoom > 1) {
-                    isDragging = true;
-                    startX = e.clientX - panX;
-                    startY = e.clientY - panY;
-                }
-            });
-
-            window.addEventListener('mouseup', () => isDragging = false);
-            
-            container.addEventListener('mousemove', (e) => {
-                if (!isDragging) return;
-                e.preventDefault();
-                panX = e.clientX - startX;
-                panY = e.clientY - startY;
-                updateZoom();
-            });
-            
+            if(container) {
+                let isDragging = false; let startX, startY;
+                container.addEventListener('mousedown', (e) => { if(currentZoom > 1) { isDragging = true; startX = e.clientX - panX; startY = e.clientY - panY; } });
+                window.addEventListener('mouseup', () => isDragging = false);
+                container.addEventListener('mousemove', (e) => { if (!isDragging) return; e.preventDefault(); panX = e.clientX - startX; panY = e.clientY - startY; updateZoom(); });
+            }
             prevBtn.disabled = index === 0;
             nextBtn.disabled = index === DATA.pages.length - 1;
         }
 
         window.setSpeed = function(audioId, rate, btn) {
             const audio = document.getElementById(audioId);
-            if(audio) {
-                audio.playbackRate = rate;
-                const parent = btn.parentElement;
-                Array.from(parent.children).forEach(c => c.classList.remove('active'));
-                btn.classList.add('active');
-            }
+            if(audio) { audio.playbackRate = rate; Array.from(btn.parentElement.children).forEach(c => c.classList.remove('active')); btn.classList.add('active'); }
         };
 
-        prevBtn.addEventListener('click', () => {
-            if (currentPageIndex > 0) {
-                currentPageIndex--;
-                renderPage(currentPageIndex);
-            }
-        });
-
-        nextBtn.addEventListener('click', () => {
-            if (currentPageIndex < DATA.pages.length - 1) {
-                currentPageIndex++;
-                renderPage(currentPageIndex);
-            }
-        });
-
+        prevBtn.addEventListener('click', () => { if (currentPageIndex > 0) { currentPageIndex--; renderPage(currentPageIndex); } });
+        nextBtn.addEventListener('click', () => { if (currentPageIndex < DATA.pages.length - 1) { currentPageIndex++; renderPage(currentPageIndex); } });
         renderPage(0);
     </script>
 </body>
@@ -305,11 +244,9 @@ export const exportToZip = async (course: CourseData) => {
 
   zip.file("index.html", htmlContent);
 
-  // Generate the ZIP file asynchronously
-  const content = await zip.generateAsync({type: "blob"});
-  
-  // Trigger Download
-  const url = URL.createObjectURL(content);
+  // 3. Download Zip
+  const zipBlob = await zip.generateAsync({type:"blob"});
+  const url = URL.createObjectURL(zipBlob);
   const a = document.createElement('a');
   a.href = url;
   a.download = `${course.title.replace(/\s+/g, '_')}_Package.zip`;
