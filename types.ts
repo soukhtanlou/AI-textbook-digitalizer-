@@ -9,35 +9,36 @@ export enum AppView {
 export interface PageData {
   id: string;
   pageNumber: number;
-  imageBase64: string;
   
-  // Base Content & Analysis (New Fields)
-  aiAnalysis: string;       // General AI analysis of the page
-  extractedText: string;    // Text inside the page
-  imageDescription: string; // Description of images
-  isContentConfirmed: boolean; // Has the user verified this content?
+  // Visuals (Now stored as filenames on disk)
+  imageFilename: string | null; 
+  
+  // Base Content & Analysis
+  aiAnalysis: string;       
+  extractedText: string;    
+  imageDescription: string; 
   
   // Teacher
   teacherScript: string;
-  teacherAudioBlob: Blob | null;
+  teacherAudioFilename: string | null; // Filename on disk
   teacherVoice: string;
-  teacherAudioSpeed: number; // 0.5 to 2.0
+  teacherAudioSpeed: number; 
   includeTeacherAudio: boolean;
 
   // Storyboard
   storyboardPrompt: string;
-  storyboardImage: string | null; // Base64 of the generated image
+  storyboardImageFilename: string | null; // Filename on disk
   includeStoryboard: boolean;
 
   // Video (Veo)
   videoPrompt: string;
-  videoBlob: Blob | null; // MP4 Blob
+  videoFilename: string | null; // Filename on disk
   videoResolution: '720p' | '1080p';
   includeVideo: boolean;
 
   // Dialogue
   dialogueScript: string;
-  dialogueAudioBlob: Blob | null;
+  dialogueAudioFilename: string | null; // Filename on disk
   dialogueSpeed: number;
   includeDialogueAudio: boolean;
 }
@@ -55,9 +56,12 @@ export interface AppState {
   view: AppView;
   isLoading: boolean;
   error: string | null;
-  apiKey: string | null; // For sharing the app
+  apiKey: string | null;
   
   courses: CourseData[];
   activeCourseId: string | null;
   activePageIndex: number;
+  
+  // Runtime handle for File System Access (not persisted in localStorage)
+  projectHandle: FileSystemDirectoryHandle | null;
 }
