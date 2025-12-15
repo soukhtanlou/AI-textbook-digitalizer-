@@ -61,4 +61,3 @@ export interface AppState {
   activeCourseId: string | null;
   activePageIndex: number;
 }
-
