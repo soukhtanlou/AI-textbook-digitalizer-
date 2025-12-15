@@ -1,12 +1,63 @@
 
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { AppState, AppView, PageData, CourseData } from './types';
 import { Layout } from './components/Layout';
-import { fileToBase64 } from './utils/audioUtils';
 import * as GeminiService from './services/geminiService';
-import { exportToZip } from './services/exportService';
+import { exportToZip } from './services/exportService'; // Changed to Zip
+import { saveFileToFolder, getFileUrl } from './utils/fileSystem';
 
-// --- COMPONENTS ---
+// --- HELPER COMPONENTS FOR ASYNC MEDIA ---
+
+const AsyncImage = ({ dirHandle, filename, className, alt }: { dirHandle: FileSystemDirectoryHandle | null, filename: string | null, className?: string, alt?: string }) => {
+    const [src, setSrc] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (!dirHandle || !filename) return;
+        let active = true;
+        let url = '';
+
+        const load = async () => {
+            try {
+                url = await getFileUrl(dirHandle, filename);
+                if (active) setSrc(url);
+            } catch (e) { console.error("Failed to load image", filename); }
+        };
+        load();
+
+        return () => { active = false; if (url) URL.revokeObjectURL(url); };
+    }, [dirHandle, filename]);
+
+    if (!src) return <div className={`bg-slate-200 animate-pulse flex items-center justify-center text-slate-400 text-xs ${className}`}>درحال بارگذاری...</div>;
+    return <img src={src} className={className} alt={alt} />;
+};
+
+const AsyncMedia = ({ dirHandle, filename, type }: { dirHandle: FileSystemDirectoryHandle | null, filename: string | null, type: 'audio' | 'video' }) => {
+    const [src, setSrc] = useState<string | null>(null);
+
+    useEffect(() => {
+        if (!dirHandle || !filename) { setSrc(null); return; }
+        let active = true;
+        let url = '';
+        
+        const load = async () => {
+            try {
+                url = await getFileUrl(dirHandle, filename);
+                if (active) setSrc(url);
+            } catch (e) { console.error("Failed to load media", filename); }
+        };
+        load();
+        
+        return () => { active = false; if (url) URL.revokeObjectURL(url); };
+    }, [dirHandle, filename]);
+
+    if (!src) return <div className="text-xs text-slate-400 p-2 border border-dashed rounded text-center">مدیا یافت نشد یا در حال بارگذاری از دیسک...</div>;
+    
+    if (type === 'video') return <video controls src={src} className="w-full rounded-lg" />;
+    return <audio controls src={src} className="w-full h-10" />;
+};
+
+
+// --- MAIN APP ---
 
 const LoadingOverlay = ({ text }: { text: string }) => (
   <div className="absolute inset-0 bg-white/90 backdrop-blur-sm z-50 flex flex-col items-center justify-center">
@@ -25,6 +76,7 @@ const App: React.FC = () => {
     courses: [],
     activeCourseId: null,
     activePageIndex: 0,
+    projectHandle: null
   });
 
   // Editor specific
@@ -36,16 +88,13 @@ const App: React.FC = () => {
 
   // --- PERSISTENCE ---
   useEffect(() => {
-    // Load state from local storage on mount
     const savedKey = localStorage.getItem('gemini_api_key');
     if (savedKey) {
-        // Simple sanitization
         const cleanKey = savedKey.replace(/[^\x20-\x7E]/g, '').trim();
         GeminiService.setApiKey(cleanKey);
         setState(prev => ({ ...prev, apiKey: cleanKey }));
     }
     
-    // Load courses if available (optional enhancement)
     const savedCourses = localStorage.getItem('saved_courses');
     if (savedCourses) {
         try {
@@ -55,7 +104,6 @@ const App: React.FC = () => {
     }
   }, []);
 
-  // Save courses on change
   useEffect(() => {
       if (state.courses.length > 0) {
           localStorage.setItem('saved_courses', JSON.stringify(state.courses));
@@ -64,7 +112,6 @@ const App: React.FC = () => {
 
   const handleLogin = () => {
       if(!tempApiKey.trim()) return;
-      // Strip invisible chars/whitespace
       const cleanKey = tempApiKey.replace(/[^\x20-\x7E]/g, '').trim();
       localStorage.setItem('gemini_api_key', cleanKey);
       GeminiService.setApiKey(cleanKey);
@@ -74,6 +121,26 @@ const App: React.FC = () => {
   const handleLogout = () => {
       localStorage.removeItem('gemini_api_key');
       setState(prev => ({ ...prev, apiKey: null }));
+  };
+
+  // --- FILE SYSTEM HELPERS ---
+  const requestProjectFolder = async () => {
+      try {
+          const handle = await (window as any).showDirectoryPicker({
+              mode: 'readwrite',
+              startIn: 'documents'
+          });
+          updateState({ projectHandle: handle });
+          return handle;
+      } catch (err) {
+          console.error("Folder access denied", err);
+          return null;
+      }
+  };
+
+  const ensureHandle = async (): Promise<FileSystemDirectoryHandle | null> => {
+      if (state.projectHandle) return state.projectHandle;
+      return await requestProjectFolder();
   };
 
   // --- HELPERS ---
@@ -122,13 +189,14 @@ const App: React.FC = () => {
           courses: [...prev.courses, newCourse],
           activeCourseId: newCourse.id,
           view: AppView.DASHBOARD,
-          activePageIndex: 0
+          activePageIndex: 0,
+          projectHandle: null // Reset handle for new context, user must pick folder
       }));
   };
 
   const deleteCourse = (e: React.MouseEvent, courseId: string) => {
       e.stopPropagation();
-      if (confirm('آیا مطمئن هستید که می‌خواهید این درس را حذف کنید؟ این کار قابل بازگشت نیست.')) {
+      if (confirm('آیا مطمئن هستید که می‌خواهید این درس را حذف کنید؟ فایل‌های روی هارد پاک نمی‌شوند، فقط از لیست برنامه حذف می‌شود.')) {
           setState(prev => ({
               ...prev,
               courses: prev.courses.filter(c => c.id !== courseId),
@@ -141,41 +209,52 @@ const App: React.FC = () => {
      const course = getActiveCourse();
      if (!course) return;
 
+     // Ensure we have a folder to save images to
+     const handle = await ensureHandle();
+     if (!handle) {
+         alert("برای ذخیره تصاویر و فایل‌ها، باید یک پوشه روی سیستم خود انتخاب کنید.");
+         return;
+     }
+
      if (e.target.files && e.target.files.length > 0) {
          updateState({ isLoading: true, error: null });
          try {
              const newPages: PageData[] = [];
              for (let i = 0; i < e.target.files.length; i++) {
                  const file = e.target.files[i];
-                 const base64 = await fileToBase64(file);
+                 const pageNum = course.pages.length + i + 1;
+                 const pageId = Date.now().toString() + i;
+                 
+                 // Save original image to disk
+                 const filename = `page_${pageId}_original.jpg`;
+                 await saveFileToFolder(handle, filename, file);
+
                  newPages.push({
-                     id: Date.now().toString() + i,
-                     pageNumber: course.pages.length + i + 1,
-                     imageBase64: base64,
+                     id: pageId,
+                     pageNumber: pageNum,
+                     imageFilename: filename,
                      
-                     // Init new fields
                      aiAnalysis: '',
                      extractedText: '',
                      imageDescription: '',
-                     isContentConfirmed: false,
 
                      teacherScript: '',
-                     teacherAudioBlob: null,
+                     teacherAudioFilename: null,
                      teacherVoice: 'Kore',
                      teacherAudioSpeed: 1.0,
                      includeTeacherAudio: true,
                      
                      storyboardPrompt: '',
-                     storyboardImage: null,
+                     storyboardImageFilename: null,
                      includeStoryboard: true,
 
                      videoPrompt: '',
-                     videoBlob: null,
+                     videoFilename: null,
                      videoResolution: '720p',
                      includeVideo: true,
                      
                      dialogueScript: '',
-                     dialogueAudioBlob: null,
+                     dialogueAudioFilename: null,
                      dialogueSpeed: 1.0,
                      includeDialogueAudio: true,
                  });
@@ -184,14 +263,17 @@ const App: React.FC = () => {
              updateActiveCourse({ pages: [...course.pages, ...newPages] });
              updateState({ isLoading: false });
          } catch (err) {
-             updateState({ error: 'خطا در افزودن فایل', isLoading: false });
+             console.error(err);
+             updateState({ error: 'خطا در ذخیره فایل‌ها روی دیسک', isLoading: false });
          }
      }
   };
 
   const handleGlobalAnalysis = async () => {
      const course = getActiveCourse();
-     if (!course || course.pages.length === 0) return;
+     const handle = state.projectHandle;
+
+     if (!course || course.pages.length === 0 || !handle) return;
      if (!course.context.trim()) {
          alert("لطفا ابتدا هدف درس و زمینه را وارد کنید.");
          return;
@@ -199,7 +281,18 @@ const App: React.FC = () => {
      
      updateState({ isLoading: true, error: null });
      try {
-         const analysis = await GeminiService.analyzeCourseMap(course.context, course.pages);
+         // We need to load images to Base64 temporarily for the AI analysis
+         // This is unavoidable, but it's temporary.
+         const pagesForAI = await Promise.all(course.pages.map(async p => {
+             if(p.imageFilename) {
+                 const blob = await handle.getFileHandle(p.imageFilename).then(h => h.getFile());
+                 const b64 = await blobToBase64(blob);
+                 return { pageNumber: p.pageNumber, imageBase64: b64 };
+             }
+             return { pageNumber: p.pageNumber, imageBase64: '' };
+         }));
+
+         const analysis = await GeminiService.analyzeCourseMap(course.context, pagesForAI);
          updateActiveCourse({ globalAnalysis: analysis }); 
          updateState({ isLoading: false });
      } catch (e) {
@@ -209,26 +302,37 @@ const App: React.FC = () => {
 
   const handleExport = async () => {
     const course = getActiveCourse();
-    if (!course) return;
+    const handle = state.projectHandle;
+    if (!course || !handle) {
+        alert("لطفا پوشه پروژه را متصل کنید.");
+        return;
+    }
     updateState({ isLoading: true });
     try {
-        await exportToZip(course);
+        await exportToZip(course, handle);
         updateState({ isLoading: false });
-    } catch (e) {
+    } catch (e: any) {
         console.error(e);
-        updateState({ isLoading: false, error: 'خطا در تولید فایل Zip' });
+        updateState({ isLoading: false, error: `خطا در تولید فایل زیپ: ${e.message}` });
     }
   };
 
-  // --- EDITOR HANDLERS ---
-
-  // 0. Analysis & Content
-  const handlePageAnalysis = async () => {
+  // Helper to load current page image as base64 for AI calls
+  const getCurrentImageBase64 = async (): Promise<string> => {
       const p = getActivePage();
-      if (!p) return;
+      const handle = state.projectHandle;
+      if (!p || !p.imageFilename || !handle) throw new Error("تصویر یا پوشه یافت نشد");
+      const blob = await handle.getFileHandle(p.imageFilename).then(h => h.getFile());
+      return await blobToBase64(blob);
+  };
+
+  // --- EDITOR HANDLERS (UPDATED FOR DISK SAVING) ---
+
+  const handlePageAnalysis = async () => {
       updateState({ isLoading: true });
       try {
-          const result = await GeminiService.analyzeSinglePage(p.imageBase64);
+          const b64 = await getCurrentImageBase64();
+          const result = await GeminiService.analyzeSinglePage(b64);
           updateCurrentPage({ 
               aiAnalysis: result.analysis,
               extractedText: result.text,
@@ -238,22 +342,13 @@ const App: React.FC = () => {
       } catch(e) { updateState({ isLoading: false, error: 'خطا در تحلیل صفحه' }); }
   };
 
-  // 1. Teacher
   const generateTeacherContent = async () => {
-      const p = getActivePage(); const c = getActiveCourse();
-      if (!p || !c) return;
+      const c = getActiveCourse();
+      if (!c) return;
       updateState({ isLoading: true });
       try {
-          const script = await GeminiService.generateTeacherScript(
-              p.imageBase64, 
-              c.context, 
-              c.globalAnalysis,
-              {
-                  analysis: p.aiAnalysis,
-                  text: p.extractedText,
-                  description: p.imageDescription
-              }
-          );
+          const b64 = await getCurrentImageBase64();
+          const script = await GeminiService.generateTeacherScript(b64, c.context, c.globalAnalysis);
           updateCurrentPage({ teacherScript: script });
           updateState({ isLoading: false });
       } catch(e) { updateState({ isLoading: false, error: 'خطا در تولید متن' }); }
@@ -261,16 +356,20 @@ const App: React.FC = () => {
 
   const generateTeacherAudio = async () => {
       const p = getActivePage();
-      if (!p || !p.teacherScript) return;
+      const handle = state.projectHandle;
+      if (!p || !p.teacherScript || !handle) return;
+      
       updateState({ isLoading: true });
       try {
           const blob = await GeminiService.generateSpeech(p.teacherScript, p.teacherVoice, p.teacherAudioSpeed);
-          updateCurrentPage({ teacherAudioBlob: blob });
+          const filename = `page_${p.id}_teacher.wav`;
+          await saveFileToFolder(handle, filename, blob);
+          
+          updateCurrentPage({ teacherAudioFilename: filename });
           updateState({ isLoading: false });
       } catch(e) { updateState({ isLoading: false, error: 'خطا در تولید صدا' }); }
   };
 
-  // 2. Storyboard
   const generateStoryboardPrompt = async () => {
       const p = getActivePage();
       if (!p) return;
@@ -278,7 +377,8 @@ const App: React.FC = () => {
       try {
           let prompt = p.storyboardPrompt;
           if (!prompt) {
-             prompt = await GeminiService.generateStoryboardPrompt(p.imageBase64);
+             const b64 = await getCurrentImageBase64();
+             prompt = await GeminiService.generateStoryboardPrompt(b64);
           }
           updateCurrentPage({ storyboardPrompt: prompt });
           updateState({ isLoading: false });
@@ -287,31 +387,31 @@ const App: React.FC = () => {
 
   const executeStoryboardGen = async () => {
       const p = getActivePage();
-      if (!p || !p.storyboardPrompt) return;
+      const handle = state.projectHandle;
+      if (!p || !p.storyboardPrompt || !handle) return;
+      
       updateState({ isLoading: true });
       try {
-          const url = await GeminiService.generateStoryboardImage(p.storyboardPrompt);
-          updateCurrentPage({ storyboardImage: url });
+          const dataUrl = await GeminiService.generateStoryboardImage(p.storyboardPrompt);
+          // Convert DataURL to Blob to save to disk
+          const res = await fetch(dataUrl);
+          const blob = await res.blob();
+          
+          const filename = `page_${p.id}_storyboard.png`;
+          await saveFileToFolder(handle, filename, blob);
+          
+          updateCurrentPage({ storyboardImageFilename: filename });
           updateState({ isLoading: false });
       } catch (err: any) {
-          const errMsg = err instanceof Error ? err.message : 'خطای ناشناخته';
-          updateState({ isLoading: false, error: `خطا در تولید تصویر: ${errMsg}` });
+          updateState({ isLoading: false, error: `خطا در تولید تصویر: ${err.message}` });
       }
   };
 
-  // 3. Video (Veo)
   const generateVideoPrompt = async () => {
-      const p = getActivePage();
-      if (!p) return;
       updateState({ isLoading: true });
       try {
-          const prompt = await GeminiService.generateVideoPrompt(
-              p.imageBase64,
-              {
-                  description: p.imageDescription,
-                  text: p.extractedText
-              }
-          );
+          const b64 = await getCurrentImageBase64();
+          const prompt = await GeminiService.generateVideoPrompt(b64);
           updateCurrentPage({ videoPrompt: prompt });
           updateState({ isLoading: false });
       } catch(e) { updateState({ isLoading: false, error: 'خطا در تولید پرامپت ویدیو' }); }
@@ -319,18 +419,24 @@ const App: React.FC = () => {
 
   const executeVideoGen = async () => {
       const p = getActivePage();
-      if (!p || !p.videoPrompt) return;
+      const handle = state.projectHandle;
+      if (!p || !p.videoPrompt || !handle) return;
+      
       updateState({ isLoading: true });
       try {
-          const blob = await GeminiService.generateVideo(p.videoPrompt, p.imageBase64, p.videoResolution);
-          updateCurrentPage({ videoBlob: blob });
+          const b64 = await getCurrentImageBase64();
+          const blob = await GeminiService.generateVideo(p.videoPrompt, b64, p.videoResolution);
+          
+          const filename = `page_${p.id}_video.mp4`;
+          await saveFileToFolder(handle, filename, blob);
+          
+          updateCurrentPage({ videoFilename: filename });
           updateState({ isLoading: false });
       } catch (err: any) {
-          updateState({ isLoading: false, error: 'خطا در تولید ویدیو (Veo). ممکن است زمان‌بر باشد یا سهمیه تمام شده باشد.' });
+          updateState({ isLoading: false, error: 'خطا در تولید ویدیو (Veo). ممکن است زمان‌بر باشد.' });
       }
   };
 
-  // 4. Dialogue
   const generateDialogueScript = async () => {
       const p = getActivePage();
       if (!p) return;
@@ -339,14 +445,8 @@ const App: React.FC = () => {
       }
       updateState({ isLoading: true });
       try {
-          const script = await GeminiService.generateDialogue(
-              p.imageBase64, 
-              p.teacherScript || "",
-              {
-                  text: p.extractedText,
-                  description: p.imageDescription
-              }
-          );
+          const b64 = await getCurrentImageBase64();
+          const script = await GeminiService.generateDialogue(b64, p.teacherScript || "");
           updateCurrentPage({ dialogueScript: script });
           updateState({ isLoading: false });
       } catch(e) { updateState({ isLoading: false, error: 'خطا در تولید دیالوگ' }); }
@@ -354,13 +454,30 @@ const App: React.FC = () => {
 
   const generateDialogueAudio = async () => {
       const p = getActivePage();
-      if (!p || !p.dialogueScript) return;
+      const handle = state.projectHandle;
+      if (!p || !p.dialogueScript || !handle) return;
+      
       updateState({ isLoading: true });
       try {
           const blob = await GeminiService.generateMultiSpeakerAudio(p.dialogueScript); 
-          updateCurrentPage({ dialogueAudioBlob: blob });
+          const filename = `page_${p.id}_dialogue.wav`;
+          await saveFileToFolder(handle, filename, blob);
+          
+          updateCurrentPage({ dialogueAudioFilename: filename });
           updateState({ isLoading: false });
       } catch(e) { updateState({ isLoading: false, error: 'خطا در تولید صدای دیالوگ' }); }
+  };
+
+  // --- HELPER FOR BASE64 ---
+  const blobToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            const result = reader.result as string;
+            resolve(result.split(',')[1]);
+        };
+        reader.readAsDataURL(blob);
+    });
   };
 
 
@@ -390,9 +507,6 @@ const App: React.FC = () => {
                       >
                           ورود 🚀
                       </button>
-                      <p className="text-xs text-center text-slate-400 mt-4">
-                          کلید شما در مرورگر خودتان ذخیره می‌شود و به سرور ما ارسال نمی‌شود.
-                      </p>
                   </div>
               </div>
           </div>
@@ -426,9 +540,7 @@ const App: React.FC = () => {
                                   className="absolute top-4 left-4 text-slate-300 hover:text-red-500 transition-colors p-1"
                                   title="حذف درس"
                               >
-                                  <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                                  </svg>
+                                  🗑
                               </button>
                               <h3 className="font-bold text-xl text-slate-800 mb-2">{c.title}</h3>
                               <p className="text-slate-500 text-sm mb-4 line-clamp-2">{c.context || 'بدون توضیحات...'}</p>
@@ -453,6 +565,31 @@ const App: React.FC = () => {
     const course = getActiveCourse();
     if (!course) return null;
 
+    if (!state.projectHandle) {
+        return (
+            <div className="flex-1 flex flex-col items-center justify-center p-8 bg-slate-100 text-center">
+                <div className="bg-white p-8 rounded-2xl shadow-xl max-w-lg w-full border border-slate-200">
+                    <div className="w-16 h-16 bg-yellow-100 text-yellow-600 rounded-full flex items-center justify-center text-3xl mx-auto mb-4">📂</div>
+                    <h2 className="text-2xl font-bold text-slate-900 mb-2">اتصال به پوشه پروژه</h2>
+                    <p className="text-slate-600 mb-6 text-sm leading-relaxed">
+                        برای جلوگیری از پر شدن حافظه مرورگر و از دست رفتن اطلاعات، فایل‌های این درس مستقیماً روی هارد دیسک شما ذخیره می‌شوند.
+                        <br/><br/>
+                        لطفا یک پوشه خالی روی کامپیوتر خود انتخاب کنید.
+                    </p>
+                    <div className="flex flex-col gap-3">
+                        <button 
+                            onClick={requestProjectFolder}
+                            className="w-full bg-cyan-600 text-white py-3 rounded-xl font-bold hover:bg-cyan-700 shadow-lg"
+                        >
+                            انتخاب پوشه ذخیره‌سازی
+                        </button>
+                        <button onClick={() => updateState({view: AppView.COURSE_LIST})} className="text-slate-400 text-sm hover:text-slate-600">بازگشت به لیست</button>
+                    </div>
+                </div>
+            </div>
+        );
+    }
+
     return (
     <div className="flex-1 p-8 overflow-y-auto bg-slate-100">
         <div className="max-w-5xl mx-auto space-y-8">
@@ -466,7 +603,7 @@ const App: React.FC = () => {
                          onClick={handleExport}
                          className="bg-green-600 text-white px-6 py-2 rounded-lg font-bold hover:bg-green-700 shadow flex items-center gap-2"
                      >
-                         <span className="text-xl">⬇</span> دانلود پکیج نهایی (.zip)
+                         <span className="text-xl">⬇</span> خروجی نهایی (ZIP)
                      </button>
                  )}
             </div>
@@ -484,7 +621,6 @@ const App: React.FC = () => {
                         <input 
                             type="text" 
                             className="w-full p-3 border border-slate-300 rounded-lg bg-white text-slate-900 focus:ring-2 focus:ring-cyan-500"
-                            placeholder="مثلا: چرخه آب - علوم سوم دبستان"
                             value={course.title}
                             disabled={course.isAnalysisConfirmed}
                             onChange={e => updateActiveCourse({ title: e.target.value })}
@@ -492,7 +628,6 @@ const App: React.FC = () => {
                         <label className="block text-sm font-bold text-slate-800">هدف یادگیری (زمینه)</label>
                         <textarea 
                             className="w-full p-3 border border-slate-300 rounded-lg h-32 bg-white text-slate-900 focus:ring-2 focus:ring-cyan-500"
-                            placeholder="توضیح دهید دانش‌آموز در پایان این درس چه چیزی باید یاد بگیرد..."
                             value={course.context}
                             disabled={course.isAnalysisConfirmed}
                             onChange={e => updateActiveCourse({ context: e.target.value })}
@@ -504,7 +639,7 @@ const App: React.FC = () => {
                         <div className="grid grid-cols-3 gap-2 mb-4">
                             {course.pages.map((p) => (
                                 <div key={p.id} className="relative aspect-[3/4] bg-slate-200 rounded border overflow-hidden">
-                                    <img src={`data:image/jpeg;base64,${p.imageBase64}`} className="w-full h-full object-cover" />
+                                    <AsyncImage dirHandle={state.projectHandle} filename={p.imageFilename} className="w-full h-full object-cover" />
                                     <div className="absolute bottom-0 left-0 right-0 bg-black/60 text-white text-xs text-center py-1">
                                         ص {p.pageNumber}
                                     </div>
@@ -540,9 +675,6 @@ const App: React.FC = () => {
 
                 {course.globalAnalysis && (
                     <div className="space-y-4 animate-fade-in">
-                        <div className="bg-amber-50 border border-amber-200 p-4 rounded-lg text-amber-800 text-sm">
-                            <strong>توجه:</strong> متن زیر نقشه راه درس است. می‌توانید آن را ویرایش کنید. وقتی مطمئن شدید، دکمه تایید را بزنید.
-                        </div>
                         <textarea 
                              className="w-full h-64 p-4 border border-slate-300 rounded-xl bg-white text-slate-900 leading-7 focus:ring-2 focus:ring-purple-500"
                              value={course.globalAnalysis}
@@ -554,7 +686,7 @@ const App: React.FC = () => {
                                 onClick={() => updateActiveCourse({ isAnalysisConfirmed: true })}
                                 className="w-full bg-green-600 text-white py-3 rounded-xl font-bold hover:bg-green-700 shadow-lg"
                             >
-                                ✅ تایید و تثبیت تحلیل (شروع تولید محتوا)
+                                ✅ تایید و تثبیت تحلیل
                             </button>
                         ) : (
                              <div className="text-center text-green-700 font-bold bg-green-50 p-3 rounded">
@@ -581,10 +713,10 @@ const App: React.FC = () => {
                                 <div className="font-bold text-slate-900 group-hover:text-cyan-600 text-lg">صفحه {p.pageNumber}</div>
                                 <div className="space-y-1 mt-2">
                                      <div className={`text-xs px-2 py-1 rounded ${p.extractedText ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>تحلیل محتوا {p.extractedText ? '✓' : ''}</div>
-                                     <div className={`text-xs px-2 py-1 rounded ${p.teacherAudioBlob ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>معلم {p.teacherAudioBlob ? '✓' : ''}</div>
-                                     <div className={`text-xs px-2 py-1 rounded ${p.storyboardImage ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>استوری‌بورد {p.storyboardImage ? '✓' : ''}</div>
-                                     <div className={`text-xs px-2 py-1 rounded ${p.videoBlob ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>ویدیو {p.videoBlob ? '✓' : ''}</div>
-                                     <div className={`text-xs px-2 py-1 rounded ${p.dialogueAudioBlob ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>دیالوگ {p.dialogueAudioBlob ? '✓' : ''}</div>
+                                     <div className={`text-xs px-2 py-1 rounded ${p.teacherAudioFilename ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>معلم {p.teacherAudioFilename ? '✓' : ''}</div>
+                                     <div className={`text-xs px-2 py-1 rounded ${p.storyboardImageFilename ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>استوری‌بورد {p.storyboardImageFilename ? '✓' : ''}</div>
+                                     <div className={`text-xs px-2 py-1 rounded ${p.videoFilename ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>ویدیو {p.videoFilename ? '✓' : ''}</div>
+                                     <div className={`text-xs px-2 py-1 rounded ${p.dialogueAudioFilename ? 'bg-green-100 text-green-700' : 'bg-slate-100 text-slate-500'}`}>دیالوگ {p.dialogueAudioFilename ? '✓' : ''}</div>
                                 </div>
                             </button>
                         ))}
@@ -598,7 +730,8 @@ const App: React.FC = () => {
 
   const renderEditor = () => {
     const page = getActivePage();
-    if (!page) return null;
+    const handle = state.projectHandle;
+    if (!page || !handle) return null;
 
     return (
         <div className="flex-1 flex flex-col h-full bg-slate-50 text-slate-900">
@@ -633,7 +766,7 @@ const App: React.FC = () => {
             <div className="flex-1 flex overflow-hidden">
                 <div className="w-80 bg-white border-l border-slate-200 p-4 overflow-y-auto hidden md:block shadow-inner">
                     <h3 className="text-xs font-bold text-slate-400 uppercase mb-2">تصویر مرجع</h3>
-                    <img src={`data:image/jpeg;base64,${page.imageBase64}`} className="w-full rounded-lg shadow border border-slate-300" />
+                    <AsyncImage dirHandle={handle} filename={page.imageFilename} className="w-full rounded-lg shadow border border-slate-300" />
                     <div className="mt-4 p-3 bg-slate-50 rounded text-xs leading-5 text-slate-700 border border-slate-200">
                         <strong>استراتژی صفحه:</strong><br/>
                         {getActiveCourse()?.globalAnalysis ? "لطفا به نقشه راه مراجعه کنید." : "نقشه راه هنوز تایید نشده."}
@@ -654,55 +787,29 @@ const App: React.FC = () => {
                                         ✨ تحلیل هوشمند صفحه
                                     </button>
                                 </div>
-
-                                {/* Box 1: AI Analysis (Editable) */}
                                 <div>
-                                    <label className="block text-sm font-bold text-slate-700 mb-2">تحلیل هوش مصنوعی:</label>
+                                    <label className="block text-sm font-bold text-slate-700 mb-2">تحلیل هوش مصنوعی (نکات آموزشی):</label>
                                     <textarea 
                                         className="w-full h-24 p-4 border border-slate-300 rounded-xl bg-slate-50 text-slate-900 leading-7 focus:ring-2 focus:ring-cyan-200 outline-none"
-                                        placeholder="اینجا تحلیل هوش مصنوعی قرار می‌گیرد..."
                                         value={page.aiAnalysis}
                                         onChange={e => updateCurrentPage({ aiAnalysis: e.target.value })}
                                     />
                                 </div>
-
-                                {/* Box 2: Extracted Text */}
                                 <div>
                                     <label className="block text-sm font-bold text-slate-700 mb-2">متن داخل صفحه:</label>
                                     <textarea 
                                         className="w-full h-32 p-4 border border-slate-300 rounded-xl bg-white text-slate-900 leading-7 focus:ring-2 focus:ring-cyan-200 outline-none"
-                                        placeholder="متن‌های استخراج شده از صفحه..."
                                         value={page.extractedText}
                                         onChange={e => updateCurrentPage({ extractedText: e.target.value })}
                                     />
                                 </div>
-
-                                {/* Box 3: Image Description */}
                                 <div>
                                     <label className="block text-sm font-bold text-slate-700 mb-2">شرح تصاویر:</label>
                                     <textarea 
                                         className="w-full h-32 p-4 border border-slate-300 rounded-xl bg-white text-slate-900 leading-7 focus:ring-2 focus:ring-cyan-200 outline-none"
-                                        placeholder="توضیح عکس‌های موجود در صفحه..."
                                         value={page.imageDescription}
                                         onChange={e => updateCurrentPage({ imageDescription: e.target.value })}
                                     />
-                                </div>
-
-                                {/* Confirmation Box */}
-                                <div className={`mt-8 p-4 rounded-xl border flex items-center justify-between transition-colors ${page.isContentConfirmed ? 'bg-green-50 border-green-200' : 'bg-slate-50 border-slate-200'}`}>
-                                    <div className="flex items-center gap-3">
-                                        <input 
-                                            type="checkbox" 
-                                            id="confirmContent"
-                                            className="w-5 h-5 text-green-600 rounded focus:ring-green-500 cursor-pointer"
-                                            checked={page.isContentConfirmed || false}
-                                            onChange={e => updateCurrentPage({ isContentConfirmed: e.target.checked })}
-                                        />
-                                        <label htmlFor="confirmContent" className={`text-sm font-bold cursor-pointer select-none ${page.isContentConfirmed ? 'text-green-800' : 'text-slate-600'}`}>
-                                            تایید نهایی: محتوا و تحلیل‌ها را بررسی کردم و صحیح است. (مبنای تولید محتوا)
-                                        </label>
-                                    </div>
-                                    {page.isContentConfirmed && <span className="text-green-600 font-bold text-xl">✓</span>}
                                 </div>
                              </div>
                         )}
@@ -720,7 +827,6 @@ const App: React.FC = () => {
                                 </div>
                                 <textarea 
                                     className="w-full h-64 p-4 border border-slate-300 rounded-xl bg-white text-slate-900 leading-7 focus:ring-2 focus:ring-indigo-200 outline-none"
-                                    placeholder="متن تدریس معلم اینجا قرار می‌گیرد..."
                                     value={page.teacherScript}
                                     onChange={e => updateCurrentPage({ teacherScript: e.target.value })}
                                 />
@@ -755,11 +861,11 @@ const App: React.FC = () => {
                                         تولید صدا 🔊
                                     </button>
                                 </div>
-                                {page.teacherAudioBlob && (
+                                {page.teacherAudioFilename && (
                                     <div className="bg-green-50 border border-green-200 p-4 rounded-lg flex flex-col gap-3">
                                         <div className="flex items-center gap-3">
                                             <div className="bg-green-100 p-2 rounded-full">✅</div>
-                                            <audio controls src={URL.createObjectURL(page.teacherAudioBlob)} className="w-full" />
+                                            <AsyncMedia dirHandle={handle} filename={page.teacherAudioFilename} type="audio" />
                                         </div>
                                         <label className="flex items-center gap-2 pt-2 border-t border-green-200 cursor-pointer">
                                             <input 
@@ -794,9 +900,6 @@ const App: React.FC = () => {
                                         onChange={e => updateCurrentPage({ storyboardPrompt: e.target.value })}
                                         placeholder="هوش مصنوعی صحنه را توصیف خواهد کرد..."
                                     />
-                                    <p className="text-xs text-red-500 font-bold bg-red-50 p-2 rounded">
-                                        نکته: تصاویر بدون متن تولید می‌شوند.
-                                    </p>
                                 </div>
                                 <button 
                                     onClick={executeStoryboardGen}
@@ -805,10 +908,10 @@ const App: React.FC = () => {
                                 >
                                     ساخت تصویر استوری‌بورد 🎨
                                 </button>
-                                {page.storyboardImage && (
+                                {page.storyboardImageFilename && (
                                     <div className="mt-6">
                                         <label className="text-sm font-bold text-slate-700 block mb-2">تصویر تولید شده:</label>
-                                        <img src={page.storyboardImage} className="w-full rounded-xl shadow-lg border border-slate-200" alt="Generated Storyboard" />
+                                        <AsyncImage dirHandle={handle} filename={page.storyboardImageFilename} className="w-full rounded-xl shadow-lg border border-slate-200" />
                                         <label className="flex items-center gap-2 mt-2 pt-2 cursor-pointer bg-slate-50 p-2 rounded border border-slate-200">
                                             <input 
                                                 type="checkbox" 
@@ -860,10 +963,10 @@ const App: React.FC = () => {
                                 >
                                     ساخت ویدیو با Veo 🎬
                                 </button>
-                                {page.videoBlob && (
+                                {page.videoFilename && (
                                     <div className="mt-6">
                                         <label className="text-sm font-bold text-slate-700 block mb-2">ویدیو خروجی:</label>
-                                        <video controls src={URL.createObjectURL(page.videoBlob)} className="w-full rounded-xl shadow-lg border border-slate-200" />
+                                        <AsyncMedia dirHandle={handle} filename={page.videoFilename} type="video" />
                                         <label className="flex items-center gap-2 mt-2 pt-2 cursor-pointer bg-slate-50 p-2 rounded border border-slate-200">
                                             <input 
                                                 type="checkbox" 
@@ -891,7 +994,6 @@ const App: React.FC = () => {
                                 </div>
                                 <textarea 
                                     className="w-full h-64 p-4 border border-slate-300 rounded-xl bg-white text-slate-900 leading-7 focus:ring-2 focus:ring-teal-200 outline-none"
-                                    placeholder="متن گفتگوی دو دانش‌آموز..."
                                     value={page.dialogueScript}
                                     onChange={e => updateCurrentPage({ dialogueScript: e.target.value })}
                                 />
@@ -913,11 +1015,11 @@ const App: React.FC = () => {
                                         تولید صدای چند نفره 🗣️
                                     </button>
                                 </div>
-                                {page.dialogueAudioBlob && (
+                                {page.dialogueAudioFilename && (
                                     <div className="bg-green-50 border border-green-200 p-4 rounded-lg flex flex-col gap-3">
                                         <div className="flex items-center gap-3">
                                             <div className="bg-green-100 p-2 rounded-full">✅</div>
-                                            <audio controls src={URL.createObjectURL(page.dialogueAudioBlob)} className="w-full" />
+                                            <AsyncMedia dirHandle={handle} filename={page.dialogueAudioFilename} type="audio" />
                                         </div>
                                         <label className="flex items-center gap-2 pt-2 border-t border-green-200 cursor-pointer">
                                             <input 
@@ -941,7 +1043,8 @@ const App: React.FC = () => {
 
   const renderPlayer = () => {
       const course = getActiveCourse();
-      if (!course) return null;
+      const handle = state.projectHandle;
+      if (!course || !handle) return null;
       const page = course.pages[playerPageIndex];
       if (!page) return null;
 
@@ -955,9 +1058,8 @@ const App: React.FC = () => {
                   </div>
 
                   <div className="flex-1 overflow-y-auto p-4 space-y-6">
-                      <img src={`data:image/jpeg;base64,${page.imageBase64}`} className="w-full rounded-lg shadow-sm border border-slate-200" />
+                      <AsyncImage dirHandle={handle} filename={page.imageFilename} className="w-full rounded-lg shadow-sm border border-slate-200" />
                       
-                      {/* Text Content Display */}
                       {(page.extractedText || page.imageDescription) && (
                           <div className="bg-slate-50 border border-slate-200 p-3 rounded-xl text-sm space-y-3">
                               {page.extractedText && (
@@ -975,36 +1077,36 @@ const App: React.FC = () => {
                           </div>
                       )}
 
-                      {page.teacherAudioBlob && (
+                      {page.teacherAudioFilename && (
                           <div className="bg-indigo-50 border border-indigo-100 p-3 rounded-xl flex flex-col gap-2">
                               <div className="flex items-center gap-2">
                                   <div className="w-8 h-8 bg-indigo-600 rounded-full flex items-center justify-center text-white text-xs">🔊</div>
                                   <span className="text-xs font-bold text-indigo-900">توضیحات معلم</span>
                               </div>
-                              <audio controls src={URL.createObjectURL(page.teacherAudioBlob)} className="w-full h-8" />
+                              <AsyncMedia dirHandle={handle} filename={page.teacherAudioFilename} type="audio" />
                           </div>
                       )}
 
-                      {page.storyboardImage && (
+                      {page.storyboardImageFilename && (
                           <div className="rounded-xl overflow-hidden border-4 border-white shadow-lg relative">
-                              <img src={page.storyboardImage} className="w-full object-cover" alt="Storyboard" />
+                              <AsyncImage dirHandle={handle} filename={page.storyboardImageFilename} className="w-full object-cover" />
                           </div>
                       )}
 
-                      {page.videoBlob && (
+                      {page.videoFilename && (
                           <div className="rounded-xl overflow-hidden border-4 border-white shadow-lg relative">
                                <div className="bg-black text-white text-xs p-1 absolute top-0 right-0 z-10">ویدیوی آموزشی</div>
-                               <video controls src={URL.createObjectURL(page.videoBlob)} className="w-full" />
+                               <AsyncMedia dirHandle={handle} filename={page.videoFilename} type="video" />
                           </div>
                       )}
 
-                      {page.dialogueAudioBlob && (
+                      {page.dialogueAudioFilename && (
                           <div className="bg-teal-50 border border-teal-100 p-3 rounded-xl flex flex-col gap-2">
                               <div className="flex items-center gap-2">
                                   <div className="w-8 h-8 bg-teal-600 rounded-full flex items-center justify-center text-white text-xs">🗣️</div>
                                   <span className="text-xs font-bold text-teal-900">گفتگوی کلاسی</span>
                               </div>
-                              <audio controls src={URL.createObjectURL(page.dialogueAudioBlob)} className="w-full h-8" />
+                              <AsyncMedia dirHandle={handle} filename={page.dialogueAudioFilename} type="audio" />
                           </div>
                       )}
                   </div>
