@@ -287,32 +287,33 @@ export const generateStoryboardImage = async (promptText: string): Promise<strin
           }
         });
 
-        if (response.promptFeedback?.blockReason) {
-            throw new Error(`تصویر به دلیل قوانین ایمنی ساخته نشد: ${response.promptFeedback.blockReason}`);
-        }
-
+        // Robust check for image data in candidates
         let imageUrl = "";
-        for (const part of response.candidates?.[0]?.content?.parts || []) {
-          if (part.inlineData) {
-            imageUrl = `data:image/png;base64,${part.inlineData.data}`;
-            break;
-          }
+        const candidate = response.candidates?.[0];
+        
+        if (candidate?.content?.parts) {
+            for (const part of candidate.content.parts) {
+                if (part.inlineData && part.inlineData.data) {
+                    imageUrl = `data:image/png;base64,${part.inlineData.data}`;
+                    break;
+                }
+            }
         }
         
         if (!imageUrl) {
             // Check for text refusal/explanation from the model
-            const textPart = response.candidates?.[0]?.content?.parts?.find(p => p.text)?.text;
+            const textPart = candidate?.content?.parts?.find(p => p.text)?.text;
+            
             if (textPart) {
-                 // If model just chats back (e.g. "I cannot generate..."), treat it as an error
                  console.warn("Model returned text instead of image:", textPart);
-                 throw new Error(`مدل به جای تصویر، متن برگرداند: "${textPart.slice(0, 100)}..." (لطفاً پرامپت را تغییر دهید)`);
+                 throw new Error(`مدل تصویر را تولید نکرد. پیام مدل: "${textPart.slice(0, 100)}..." (لطفاً پرامپت را تغییر دهید)`);
             }
 
-            const finishReason = response.candidates?.[0]?.finishReason;
-            if (finishReason && finishReason !== 'STOP') {
-                throw new Error(`تولید متوقف شد: ${finishReason}`);
+            const finishReason = candidate?.finishReason;
+            if (finishReason) {
+                throw new Error(`تولید تصویر متوقف شد. دلیل: ${finishReason}`);
             }
-            throw new Error("تصویر تولید نشد. لطفا پرامپت را تغییر دهید.");
+            throw new Error("تصویر تولید نشد. لطفا پرامپت را تغییر دهید یا دوباره تلاش کنید.");
         }
         return imageUrl;
       } catch (error: any) {
